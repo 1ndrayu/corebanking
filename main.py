@@ -1,22 +1,33 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, UUID4, Field, condecimal
-from sqlalchemy import create_engine, Column, String, DateTime, ForeignKey, Numeric, Enum, Boolean, func
+from sqlalchemy import create_engine, Column, String, DateTime, ForeignKey, Numeric, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy.orm import sessionmaker, Session
 from uuid import uuid4
 from enum import Enum as PyEnum
-from datetime import datetime
-from typing import Optional, List
-
-# ───── DATABASE SETUP ───────────────────────────────────────
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from typing import Optional
 import os
+
+# ───── DATABASE SETUP ─────
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://default_user:default_pass@localhost/corebanking")
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-engine = create_async_engine(DATABASE_URL, future=True)
-async_session = sessionmaker(engine, class_=AsyncSession)
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# ───── ENUMS ────────────────────────────────────────────────
+# ───── SECURITY CONFIG ─────
+SECRET_KEY = "your-secret-key"  # Use environment variable in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
+
+# ───── ENUMS ─────
 class AccountType(str, PyEnum):
     savings = "savings"
     current = "current"
@@ -26,29 +37,16 @@ class TransactionType(str, PyEnum):
     deposit = "deposit"
     withdraw = "withdraw"
     transfer = "transfer"
-    chargeback = "chargeback"
 
-class KYCStatus(str, PyEnum):
-    pending = "pending"
-    verified = "verified"
-    rejected = "rejected"
-
-class FlagType(str, PyEnum):
-    fraud_suspect = "fraud_suspect"
-    high_risk = "high_risk"
-    over_limit = "over_limit"
-
-
-# ───── MODELS ───────────────────────────────────────────────
+# ───── MODELS ─────
 class User(Base):
     __tablename__ = "users"
     id = Column(String, primary_key=True, default=lambda: str(uuid4()))
     full_name = Column(String)
     email = Column(String, unique=True)
+    hashed_password = Column(String)
     phone = Column(String)
-    kyc_status = Column(String, default="pending")
     created_at = Column(DateTime, default=func.now())
-
 
 class Account(Base):
     __tablename__ = "accounts"
@@ -58,7 +56,6 @@ class Account(Base):
     account_number = Column(String, unique=True)
     status = Column(String, default="active")
     created_at = Column(DateTime, default=func.now())
-
 
 class Transaction(Base):
     __tablename__ = "transactions"
@@ -71,28 +68,17 @@ class Transaction(Base):
     status = Column(String, default="success")
     created_at = Column(DateTime, default=func.now())
 
-
 class Balance(Base):
     __tablename__ = "balances"
     account_id = Column(String, ForeignKey("accounts.id"), primary_key=True)
     available_balance = Column(Numeric(12, 2), default=0)
     last_updated = Column(DateTime, default=func.now())
 
-
-class MLFlag(Base):
-    __tablename__ = "ml_flags"
-    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
-    txn_id = Column(String, ForeignKey("transactions.id"))
-    flag_type = Column(String)
-    model_score = Column(Numeric)
-    is_resolved = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=func.now())
-
-
-# ───── SCHEMAS ──────────────────────────────────────────────
+# ───── SCHEMAS ─────
 class UserCreate(BaseModel):
     full_name: str
     email: EmailStr
+    password: str
     phone: Optional[str]
 
 class AccountCreate(BaseModel):
@@ -106,9 +92,11 @@ class TransactionCreate(BaseModel):
     txn_type: TransactionType
     reference_note: Optional[str] = None
 
-# ───── FASTAPI SETUP ────────────────────────────────────────
-app = FastAPI()
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
+# ───── UTILS ─────
 def get_db():
     db = SessionLocal()
     try:
@@ -116,25 +104,70 @@ def get_db():
     finally:
         db.close()
 
-# ───── USER ENDPOINTS ──────────────────────────────────────
-@app.post("/users")
-async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
-    async with db.begin():
-        new_user = User(**user.dict())
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
-    return new_user
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
 
-from fastapi.security import OAuth2PasswordBearer
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+def hash_password(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(status_code=401, detail="Invalid token")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if not email:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise credentials_exception
+    return user
+
+# ───── APP SETUP ─────
+app = FastAPI()
+
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
+
+# ───── AUTH ─────
+@app.post("/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# ───── USERS ─────
+@app.post("/users")
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    new_user = User(
+        full_name=user.full_name,
+        email=user.email,
+        phone=user.phone,
+        hashed_password=hash_password(user.password)
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return {"id": new_user.id, "email": new_user.email}
 
 @app.get("/users/me")
-async def read_users_me(token: str = Depends(oauth2_scheme)):
-    # Decode and validate JWT token here
-    return {"token": token}
+def read_users_me(current_user: User = Depends(get_current_user)):
+    return {"id": current_user.id, "email": current_user.email}
 
-# ───── ACCOUNT ENDPOINTS ───────────────────────────────────
+# ───── ACCOUNTS ─────
 @app.post("/accounts")
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     account_number = str(uuid4().int)[0:12]
@@ -146,160 +179,40 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     db.add(acc)
     db.commit()
     db.refresh(acc)
-    # initialize balance
-    db.add(Balance(account_id=acc.id, available_balance=0))
+    db.add(Balance(account_id=acc.id))
     db.commit()
     return acc
 
-# ───── TRANSACTION ENDPOINTS ───────────────────────────────
-@app.post("/transactions")
-def make_transaction(txn: TransactionCreate, db: Session = Depends(get_db)):
-    # Basic balance checks
-    if txn.txn_type == "transfer":
-        if not txn.from_account_id or not txn.to_account_id:
-            raise HTTPException(400, "Transfer requires from and to accounts")
-        from_balance = db.query(Balance).filter_by(account_id=str(txn.from_account_id)).first()
-        if from_balance.available_balance < txn.amount:
-            raise HTTPException(400, "Insufficient balance")
+@app.get("/accounts/{account_id}/balance")
+def get_balance(account_id: UUID4, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    bal = db.query(Balance).filter_by(account_id=str(account_id)).first()
+    if not bal:
+        raise HTTPException(404, "Balance not found")
+    return bal
 
-        from_balance.available_balance -= txn.amount
-        to_balance = db.query(Balance).filter_by(account_id=str(txn.to_account_id)).first()
-        to_balance.available_balance += txn.amount
+# ───── TRANSACTIONS ─────
+@app.post("/transactions")
+def make_transaction(txn: TransactionCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if txn.txn_type == "transfer":
+        from_bal = db.query(Balance).filter_by(account_id=str(txn.from_account_id)).first()
+        to_bal = db.query(Balance).filter_by(account_id=str(txn.to_account_id)).first()
+        if from_bal.available_balance < txn.amount:
+            raise HTTPException(400, "Insufficient balance")
+        from_bal.available_balance -= txn.amount
+        to_bal.available_balance += txn.amount
 
     elif txn.txn_type == "deposit":
-        to_balance = db.query(Balance).filter_by(account_id=str(txn.to_account_id)).first()
-        to_balance.available_balance += txn.amount
+        to_bal = db.query(Balance).filter_by(account_id=str(txn.to_account_id)).first()
+        to_bal.available_balance += txn.amount
 
     elif txn.txn_type == "withdraw":
-        from_balance = db.query(Balance).filter_by(account_id=str(txn.from_account_id)).first()
-        if from_balance.available_balance < txn.amount:
+        from_bal = db.query(Balance).filter_by(account_id=str(txn.from_account_id)).first()
+        if from_bal.available_balance < txn.amount:
             raise HTTPException(400, "Insufficient funds")
-        from_balance.available_balance -= txn.amount
+        from_bal.available_balance -= txn.amount
 
     transaction = Transaction(**txn.dict())
     db.add(transaction)
     db.commit()
     db.refresh(transaction)
     return transaction
-
-# ───── BALANCE LOOKUP ──────────────────────────────────────
-@app.get("/accounts/{account_id}/balance")
-def get_balance(account_id: UUID4, db: Session = Depends(get_db)):
-    bal = db.query(Balance).filter_by(account_id=str(account_id)).first()
-    if not bal:
-        raise HTTPException(404, "Balance record not found")
-    return bal
-
-# ───── INIT SCHEMA ON START ────────────────────────────────
-@app.on_event("startup")
-def create_tables():
-    Base.metadata.create_all(bind=engine)
-
-# ───── ERROR HANDLING ────────────────────────────────
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
-
-class CustomException(Exception):
-    def __init__(self, name: str):
-        self.name = name
-
-@app.exception_handler(CustomException)
-async def custom_exception_handler(request: Request, exc: CustomException):
-    return JSONResponse(
-        status_code=400,
-        content={"message": f"Something went wrong: {exc.name}"},
-    )
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"message": exc.detail},
-    )
-
-# ───── TRANSACTION VALIDATION ────────────────────────────────
-from sqlalchemy.orm import Session
-from fastapi import Depends, HTTPException
-from sqlalchemy import select
-from models import Account, Transaction, Balance
-
-# This is the route for transferring funds between accounts
-@app.post("/transactions/transfer/")
-async def transfer_funds(from_account_id: int, to_account_id: int, amount: float, db: Session = Depends(get_db)):
-    # Check if accounts exist
-    from_account = db.execute(select(Account).filter(Account.id == from_account_id)).scalar()
-    to_account = db.execute(select(Account).filter(Account.id == to_account_id)).scalar()
-
-    if not from_account or not to_account:
-        raise HTTPException(status_code=404, detail="One or both accounts not found")
-    
-    # Check if there are sufficient funds in the 'from_account'
-    balance = db.execute(select(Balance).filter(Balance.account_id == from_account_id)).scalar()
-    if balance and balance.available_balance < amount:
-        raise HTTPException(status_code=400, detail="Insufficient funds")
-    
-    # Deduct funds from the sender account
-    balance.available_balance -= amount
-    db.commit()
-
-    # Add funds to the recipient account
-    recipient_balance = db.execute(select(Balance).filter(Balance.account_id == to_account_id)).scalar()
-    if not recipient_balance:
-        raise HTTPException(status_code=404, detail="Recipient account not found")
-    
-    recipient_balance.available_balance += amount
-    db.commit()
-
-    # Create the transaction record
-    transaction = Transaction(from_account_id=from_account_id, to_account_id=to_account_id, amount=amount)
-    db.add(transaction)
-    db.commit()
-
-    return {"message": "Transfer successful", "transaction_id": transaction.id}
-
-# ───── DAILY TRANSACTION LIMITS ────────────────────────────────
-from datetime import datetime, timedelta
-
-@app.post("/transactions/transfer/")
-async def transfer_funds_with_limit(from_account_id: int, to_account_id: int, amount: float, db: Session = Depends(get_db)):
-    # Fetch account data
-    from_account = db.execute(select(Account).filter(Account.id == from_account_id)).scalar()
-    to_account = db.execute(select(Account).filter(Account.id == to_account_id)).scalar()
-
-    if not from_account or not to_account:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    # Check for daily transaction limit (example limit is 5000)
-    today = datetime.utcnow().date()
-    total_today = db.execute(
-        select(Transaction)
-        .filter(Transaction.from_account_id == from_account_id, Transaction.created_at >= today)
-    ).all()
-    
-    daily_limit = 100000  # Set daily limit
-    total_transferred_today = sum(txn.amount for txn in total_today)
-
-    if total_transferred_today + amount > daily_limit:
-        raise HTTPException(status_code=400, detail="Daily transaction limit exceeded")
-
-    # Check for sufficient balance
-    balance = db.execute(select(Balance).filter(Balance.account_id == from_account_id)).scalar()
-    if balance and balance.available_balance < amount:
-        raise HTTPException(status_code=400, detail="Insufficient funds")
-
-    # Process the transaction (same as before)
-    balance.available_balance -= amount
-    db.commit()
-
-    recipient_balance = db.execute(select(Balance).filter(Balance.account_id == to_account_id)).scalar()
-    recipient_balance.available_balance += amount
-    db.commit()
-
-    transaction = Transaction(from_account_id=from_account_id, to_account_id=to_account_id, amount=amount)
-    db.add(transaction)
-    db.commit()
-
-    return {"message": "Transfer successful", "transaction_id": transaction.id}
-
