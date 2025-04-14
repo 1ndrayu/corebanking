@@ -183,3 +183,67 @@ def get_balance(account_id: UUID4, db: Session = Depends(get_db)):
 @app.on_event("startup")
 def create_tables():
     Base.metadata.create_all(bind=engine)
+
+# ───── ERROR HANDLING ────────────────────────────────
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+class CustomException(Exception):
+    def __init__(self, name: str):
+        self.name = name
+
+@app.exception_handler(CustomException)
+async def custom_exception_handler(request: Request, exc: CustomException):
+    return JSONResponse(
+        status_code=400,
+        content={"message": f"Something went wrong: {exc.name}"},
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.detail},
+    )
+
+# ───── TRANSACTION VALIDATION ────────────────────────────────
+from sqlalchemy.orm import Session
+from fastapi import Depends, HTTPException
+from sqlalchemy import select
+from models import Account, Transaction, Balance
+
+# This is the route for transferring funds between accounts
+@app.post("/transactions/transfer/")
+async def transfer_funds(from_account_id: int, to_account_id: int, amount: float, db: Session = Depends(get_db)):
+    # Check if accounts exist
+    from_account = db.execute(select(Account).filter(Account.id == from_account_id)).scalar()
+    to_account = db.execute(select(Account).filter(Account.id == to_account_id)).scalar()
+
+    if not from_account or not to_account:
+        raise HTTPException(status_code=404, detail="One or both accounts not found")
+    
+    # Check if there are sufficient funds in the 'from_account'
+    balance = db.execute(select(Balance).filter(Balance.account_id == from_account_id)).scalar()
+    if balance and balance.available_balance < amount:
+        raise HTTPException(status_code=400, detail="Insufficient funds")
+    
+    # Deduct funds from the sender account
+    balance.available_balance -= amount
+    db.commit()
+
+    # Add funds to the recipient account
+    recipient_balance = db.execute(select(Balance).filter(Balance.account_id == to_account_id)).scalar()
+    if not recipient_balance:
+        raise HTTPException(status_code=404, detail="Recipient account not found")
+    
+    recipient_balance.available_balance += amount
+    db.commit()
+
+    # Create the transaction record
+    transaction = Transaction(from_account_id=from_account_id, to_account_id=to_account_id, amount=amount)
+    db.add(transaction)
+    db.commit()
+
+    return {"message": "Transfer successful", "transaction_id": transaction.id}
