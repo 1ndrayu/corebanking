@@ -198,4 +198,3 @@ async def startup():
 async def shutdown():
     """Close database connection on shutdown."""
     await engine.dispose()
-
