@@ -247,3 +247,48 @@ async def transfer_funds(from_account_id: int, to_account_id: int, amount: float
     db.commit()
 
     return {"message": "Transfer successful", "transaction_id": transaction.id}
+
+# ───── DAILY TRANSACTION LIMITS ────────────────────────────────
+from datetime import datetime, timedelta
+
+@app.post("/transactions/transfer/")
+async def transfer_funds_with_limit(from_account_id: int, to_account_id: int, amount: float, db: Session = Depends(get_db)):
+    # Fetch account data
+    from_account = db.execute(select(Account).filter(Account.id == from_account_id)).scalar()
+    to_account = db.execute(select(Account).filter(Account.id == to_account_id)).scalar()
+
+    if not from_account or not to_account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    # Check for daily transaction limit (example limit is 5000)
+    today = datetime.utcnow().date()
+    total_today = db.execute(
+        select(Transaction)
+        .filter(Transaction.from_account_id == from_account_id, Transaction.created_at >= today)
+    ).all()
+    
+    daily_limit = 100000  # Set daily limit
+    total_transferred_today = sum(txn.amount for txn in total_today)
+
+    if total_transferred_today + amount > daily_limit:
+        raise HTTPException(status_code=400, detail="Daily transaction limit exceeded")
+
+    # Check for sufficient balance
+    balance = db.execute(select(Balance).filter(Balance.account_id == from_account_id)).scalar()
+    if balance and balance.available_balance < amount:
+        raise HTTPException(status_code=400, detail="Insufficient funds")
+
+    # Process the transaction (same as before)
+    balance.available_balance -= amount
+    db.commit()
+
+    recipient_balance = db.execute(select(Balance).filter(Balance.account_id == to_account_id)).scalar()
+    recipient_balance.available_balance += amount
+    db.commit()
+
+    transaction = Transaction(from_account_id=from_account_id, to_account_id=to_account_id, amount=amount)
+    db.add(transaction)
+    db.commit()
+
+    return {"message": "Transfer successful", "transaction_id": transaction.id}
+
