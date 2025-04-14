@@ -9,9 +9,11 @@ from datetime import datetime
 from typing import Optional, List
 
 # ───── DATABASE SETUP ───────────────────────────────────────
-DATABASE_URL = "postgresql://postgres:postgres@localhost/corebanking"
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+import os
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://default_user:default_pass@localhost/corebanking")
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+engine = create_async_engine(DATABASE_URL, future=True)
+async_session = sessionmaker(engine, class_=AsyncSession)
 Base = declarative_base()
 
 # ───── ENUMS ────────────────────────────────────────────────
@@ -116,12 +118,21 @@ def get_db():
 
 # ───── USER ENDPOINTS ──────────────────────────────────────
 @app.post("/users")
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    new_user = User(**user.dict())
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+async def create_user(user: UserCreate, db: AsyncSession = Depends(get_db)):
+    async with db.begin():
+        new_user = User(**user.dict())
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)
     return new_user
+
+from fastapi.security import OAuth2PasswordBearer
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+@app.get("/users/me")
+async def read_users_me(token: str = Depends(oauth2_scheme)):
+    # Decode and validate JWT token here
+    return {"token": token}
 
 # ───── ACCOUNT ENDPOINTS ───────────────────────────────────
 @app.post("/accounts")
